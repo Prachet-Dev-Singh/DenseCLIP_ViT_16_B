@@ -105,10 +105,5 @@ model:
 ## Usage
 ### Training
 ```bash
-python segmentation/train_denseclip.py configs/denseclip_cityscapes.yaml --work-dir work_dirs/cityscapes_run_RN50_frozen
+python train_denseclip.py     configs/denseclip_cityscapes.yaml     --work-dir work_dirs/cityscapes_run_ViT16_frozen
 ```
-### Resume Training
-```bash
-python segmentation/train_denseclip.py configs/denseclip_cityscapes.yaml \
-    --work-dir work_dirs/cityscapes_run_RN50_frozen \
-    --resume work_dirs/cityscapes_run_RN50_frozen/checkpoints/epoch_10.pth
