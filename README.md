@@ -99,7 +99,7 @@ data:
   path: 'data/cityscapes'  # Verify this path
   
 model:
-  clip_pretrained: 'segmentation/pretrained/RN50.pt'  # Path to CLIP weights
+  clip_pretrained: 'segmentation/pretrained/ViT-B-16.pt'  # Path to CLIP weights
 ```
 
 ## Usage
