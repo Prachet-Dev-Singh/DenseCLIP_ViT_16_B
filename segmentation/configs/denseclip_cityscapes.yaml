@@ -18,6 +18,7 @@ model:
     layers: 12                # Number of transformer layers for ViT-B/16
     heads: 12                 # Number of attention heads for ViT-B/16
     output_dim: 768
+    out_indices: [7, 11] # Example indices - MAKE SURE THIS IS SET!
 
   text_encoder:
     type: 'CLIPTextEncoder'
@@ -34,9 +35,17 @@ model:
   #   out_channels: 256
   #   num_outs: 4 # Or 5 if using extra level
 
+  # --- VVVVVV ADD NECK SECTION VVVVVV ---
+  neck:
+    type: 'ViTFeatureFusionNeck'      # <<< Use the name of your new neck class
+    in_channels_list: [768, 768]      # <<< Channels matching ViT width for out_indices [7, 11]
+    out_channels: 256                 # <<< Desired output channels of the neck (e.g., 256)
+    inter_channels: 128               # <<< Optional: Internal channels for processing blocks (e.g., 128)
+  # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
+
   decode_head:
     type: 'FPNHead'
-    in_channels: 768 #768 earlier
+    in_channels: 256 #768 earlier
     channels: 256
     num_classes: 19
     align_corners: False
