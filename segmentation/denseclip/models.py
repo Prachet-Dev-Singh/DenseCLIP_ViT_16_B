@@ -10,6 +10,15 @@ from timm.layers import drop, drop_path, trunc_normal_
 import math
 from timm.models.vision_transformer import VisionTransformer
 
+class ConvBNReLU(nn.Sequential):
+    """Basic Conv-BatchNorm-ReLU block."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1):
+        super().__init__(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
 # Placeholder for DropPath if not using timm
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
@@ -380,15 +389,19 @@ class CLIPVisionTransformer(nn.Module):
                  heads: int = 12,     # Num heads for ViT-B/16
                  output_dim: int = 768, # Set to width to output features before projection
                  drop_path_rate: float = 0.0,
+                 # --- VVVVV MODIFIED/ADDED VVVVV ---
+                 out_indices = None, # Default to None
+                 # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
                  pretrained: str = None, # Path to pre-trained weights
                  **kwargs): # Absorb extra kwargs
         super().__init__()
         self.pretrained = pretrained
         self.input_resolution = input_resolution
-        # Set output_dim to transformer width to return features before final CLIP proj
+        # Set output_dim to transformer width
         self.output_dim = width
+        self.layers = layers # Store layers count
         logger.info(f"CLIPVisionTransformer: Initializing with width={width}, layers={layers}, heads={heads}")
-        logger.info(f"Output dimension set to {self.output_dim} (features before final projection)")
+        logger.info(f"Internal feature dimension set to {self.output_dim} (transformer width)")
 
         # Patch Embedding
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
@@ -407,14 +420,27 @@ class CLIPVisionTransformer(nn.Module):
         self.ln_pre = LayerNorm(width)
 
         # Transformer Blocks
+        # Ensure your Transformer class definition is available and imported correctly
         self.transformer = Transformer(width, layers, heads, drop_path_rate=drop_path_rate)
 
         # Standard final layers from CLIP ViT (defined to load weights)
         self.ln_post = LayerNorm(width)
         # Define proj layer even if not used in forward, to match checkpoint keys
-        # Assume standard CLIP ViT-B/16 proj dimension is 512
-        self._clip_proj_dim = 512
+        self._clip_proj_dim = 512 # Standard CLIP ViT-B/16 output dim
         self.proj = nn.Parameter(scale * torch.randn(width, self._clip_proj_dim))
+
+        # --- VVVVV Store out_indices VVVVV ---
+        if out_indices is None:
+            self.out_indices = [layers - 1] # Default to only the last layer index (0-based)
+            logger.info("out_indices not specified, defaulting to output from last layer only.")
+        else:
+             # Ensure indices are valid
+            if not isinstance(out_indices, (list, tuple)): raise TypeError("out_indices must be list or tuple")
+            for i in out_indices:
+                if not 0 <= i < layers: raise ValueError(f"Index {i} in out_indices is out of range for {layers} layers.")
+            self.out_indices = sorted(list(set(out_indices))) # Store unique sorted indices
+        logger.info(f"CLIPVisionTransformer will output features from layer indices: {self.out_indices}")
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
 
         # Initialize weights AFTER all layers are defined
         self.init_weights()
@@ -518,45 +544,57 @@ class CLIPVisionTransformer(nn.Module):
         B, Cin, Hin, Win = x.shape
         # Patch embedding
         x = self.conv1(x)
-        H, W = x.shape[-2:] # Get grid height/width AFTER patch embedding
+        H, W = x.shape[-2:] # Actual grid height/width
         x = x.flatten(2).transpose(1, 2)  # [B, H*W, width] (NLC format)
 
         # Prepend class token
-        # Create class embedding dynamically on correct device/dtype
         class_embed = self.class_embedding.to(x.dtype).expand(B, 1, -1)
         x = torch.cat([class_embed, x], dim=1)  # [B, 1 + H*W, width]
 
         # Add positional embedding (interpolating if necessary)
-        # Ensure interpolate_pos_encoding method exists and works
         pos_embed = self.interpolate_pos_encoding(x, H, W)
         x = x + pos_embed
 
-        # Pre-LN and Transformer pass
+        # Pre-LN
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # NLC -> LND
-        x = self.transformer(x) # Pass through transformer blocks
-        x = x.permute(1, 0, 2)  # LND -> NLC
 
-        # Final Layer Norm (applied to full sequence)
-        x = self.ln_post(x) # [B, 1+H*W, width]
+        # --- VVVVV Store intermediate features VVVVV ---
+        intermediate_features = []
+        # Pass through transformer blocks
+        for i, blk in enumerate(self.transformer.resblocks):
+            x = blk(x) # Input/Output is LND
+            # Check if current layer index is one we want to output
+            if i in self.out_indices:
+                # Process output for storage: LND -> NLC -> spatial
+                out_feat_seq = x.permute(1, 0, 2) # LND -> NLC [B, 1+HW, D]
 
-        # Extract spatial features (patch tokens) - Exclude CLS token
-        patch_tokens = x[:, 1:, :] # [B, H*W, width]
-        D = patch_tokens.shape[-1] # Should be transformer width (e.g., 768)
+                # Apply final LayerNorm ONLY if it's the very last layer index requested
+                # AND the last layer index IS actually the final block of the transformer
+                if i == self.layers - 1:
+                     logger.debug(f"Applying ln_post to output index {i}")
+                     out_feat_seq = self.ln_post(out_feat_seq)
 
-        # Reshape patch tokens into spatial map: [B, D, H, W]
-        spatial_features = patch_tokens.permute(0, 2, 1).reshape(B, D, H, W)
+                patch_tokens = out_feat_seq[:, 1:, :] # Exclude CLS token [B, HW, D]
+                D = patch_tokens.shape[-1]
+                # Reshape to spatial map: [B, D, H, W]
+                spatial_map = patch_tokens.permute(0, 2, 1).reshape(B, D, H, W)
+                intermediate_features.append(spatial_map)
+                logger.debug(f"Stored intermediate feature from layer {i}, shape: {spatial_map.shape}")
 
-        # --- Return spatial map wrapped in a list ---
-        # Make absolutely sure this is the ONLY return statement executed
-        #logger.debug(f"CLIPVisionTransformer returning spatial features shape: {spatial_features.shape}")
-        output_to_return = [spatial_features]
+        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
 
-        tensor_inside = output_to_return[0]
-        #print(f"!!!!!!!!!! ViT Forward RETURNING type: {type(output_to_return)}, len: {len(output_to_return)}, element[0] type: {type(tensor_inside)}, element[0] ndim: {tensor_inside.ndim}, element[0] shape: {tensor_inside.shape}")
-        # --- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---
-        #logger.debug(f"CLIPVisionTransformer returning spatial features shape: {spatial_features.shape}")
-        return output_to_return
+        # Ensure features were collected for all specified indices
+        if len(intermediate_features) != len(self.out_indices):
+             logger.warning(f"Collected {len(intermediate_features)} features, but expected {len(self.out_indices)} based on out_indices. Check transformer loop.")
+             # Handle error? Maybe return empty list or raise?
+             if not intermediate_features: # If nothing was collected
+                  logger.error("No intermediate features collected.")
+                  return [] # Return empty
+
+        # Return the list of collected spatial feature maps
+        logger.debug(f"ViT returning {len(intermediate_features)} feature maps.")
+        return intermediate_features # Returns list: [feat_idx1, feat_idx2, ...]
 
 
 class CLIPTextEncoder(nn.Module):
@@ -675,6 +713,73 @@ class CLIPTextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         return x
 
+
+class ViTFeatureFusionNeck(nn.Module):
+    """
+    A simple neck to fuse features from different ViT layers.
+    Assumes all input features have the same spatial size but different semantics.
+    Applies separate convs, concatenates, then fuses with a final conv.
+    """
+    def __init__(self,
+                 in_channels_list, # List of input channels (e.g., [768, 768] for ViT-B/16)
+                 out_channels,     # Desired output channel dimension for the fused feature map
+                 inter_channels=None # Optional intermediate channel size for processing layers
+                 ):
+        super().__init__()
+        if not isinstance(in_channels_list, (list, tuple)):
+             raise TypeError("in_channels_list must be a list or tuple")
+        if inter_channels is None:
+             inter_channels = out_channels # Default: process directly to out_channels
+
+        self.num_inputs = len(in_channels_list)
+        self.process_layers = nn.ModuleList()
+
+        total_inter_channels = 0
+        for i in range(self.num_inputs):
+             # Apply a Conv block (e.g., 3x3) to each input feature level
+             # This allows each level to be processed independently first
+             # Use ConvBNReLU defined above
+             layer = ConvBNReLU(in_channels_list[i], inter_channels, kernel_size=3, padding=1)
+             self.process_layers.append(layer)
+             total_inter_channels += inter_channels
+             logger.info(f"Fusion Neck: Process layer {i} ({in_channels_list[i]} -> {inter_channels})")
+
+        # Final fusion layer after concatenation
+        # Takes concatenated features (total_inter_channels) and outputs 'out_channels'
+        # Use ConvBNReLU defined above
+        self.fusion_layer = ConvBNReLU(total_inter_channels, out_channels, kernel_size=1, padding=0) # Use 1x1 conv for fusion
+        logger.info(f"Fusion Neck: Fusion layer ({total_inter_channels} -> {out_channels})")
+
+        self.apply(self._init_weights) # Initialize weights
+
+    def _init_weights(self, m):
+         if isinstance(m, nn.Conv2d):
+             nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+         elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+             nn.init.constant_(m.weight, 1); nn.init.constant_(m.bias, 0)
+
+    def forward(self, features):
+        # Input 'features' is a list of tensors [feat_idx1, feat_idx2, ...]
+        if len(features) != self.num_inputs:
+             logger.error(f"Fusion Neck received {len(features)} inputs, expected {self.num_inputs}")
+             # Handle error gracefully, maybe return only first feature? Needs better handling.
+             return [features[0]] if features else [] # Return list with first or empty list
+
+        processed_features = []
+        for i in range(self.num_inputs):
+            feat = self.process_layers[i](features[i])
+            processed_features.append(feat)
+
+        # Concatenate processed features along the channel dimension
+        concatenated_features = torch.cat(processed_features, dim=1)
+        logger.debug(f"Fusion Neck: Concatenated shape: {concatenated_features.shape}")
+
+        # Apply final fusion layer
+        fused_features = self.fusion_layer(concatenated_features)
+        logger.debug(f"Fusion Neck: Fused output shape: {fused_features.shape}")
+
+        # Return the single fused feature map, wrapped in a list for consistency
+        return [fused_features]
 
 
 class CLIPTextContextEncoder(nn.Module):
